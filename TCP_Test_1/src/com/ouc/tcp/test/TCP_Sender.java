@@ -9,6 +9,9 @@ public class TCP_Sender extends TCP_Sender_ADT {
     private volatile int flag = 0;
     private int currentSeq = 1;     // 当前序列号
 
+    // 新增：记录最后发送的序列号，用于检查ACK序列号
+    private int lastSentSeq = 0;    // 最后发送的数据包序列号
+
     /* 构造函数 */
     public TCP_Sender() {
         super();    // 调用超类构造函数
@@ -20,7 +23,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
     public void rdt_send(int dataIndex, int[] appData) {
 
         // 生成TCP数据报（设置序号和数据字段/校验和）
-        currentSeq = dataIndex * appData.length + 1;  // 包序号设置为字节流号
+        currentSeq = dataIndex * appData.length + 1;
         tcpH.setTh_seq(currentSeq);
         tcpS.setData(appData);
         tcpPack = new TCP_PACKET(tcpH, tcpS, destinAddr);
@@ -30,6 +33,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
         tcpH.setTh_sum(checksum);
         tcpPack.setTcpH(tcpH);
 
+        lastSentSeq = currentSeq;
         // 发送TCP数据报
         udt_send(tcpPack);
         flag = 0;
@@ -55,19 +59,37 @@ public class TCP_Sender extends TCP_Sender_ADT {
     public void waitACK() {
         if(!ackQueue.isEmpty()) {
             int currentAck = ackQueue.poll();
-            if (currentAck == currentSeq) {
-                System.out.println("Clear: " + currentSeq);
-                flag = 1;  // 设置标志，结束等待
-            } else if (currentAck == -1) {
-                // 收到NAK（负确认），需要重传
-                System.out.println("Received NAK, retransmit: " + currentSeq);
-                udt_send(tcpPack);  // 重传数据包
-                flag = 0;  // 继续保持等待状态
+            if (currentAck >= 0) {
+                // 正确认，检查序列号
+                if (currentAck == lastSentSeq) {
+                    System.out.println("Correct ACK received for seq: " + currentAck);
+                    flag = 1;  // 设置标志，结束等待
+                } else if (currentAck < lastSentSeq) {
+                    // 收到旧的ACK，说明ACK延迟或重复，需要重新发送当前包
+                    System.out.println("Received old/duplicate ACK: " + currentAck +
+                            ", expected ACK for seq: " + lastSentSeq);
+                    udt_send(tcpPack);  // 重传数据包
+                    flag = 0;  // 继续保持等待状态
+                } else {
+                    // 收到未来的ACK（不应该发生）
+                    System.out.println("Received future ACK: " + currentAck +
+                            ", last sent seq: " + lastSentSeq);
+                    flag = 0;  // 保持等待
+                }
             } else {
-                // 收到错误的ACK，可能是重复的ACK，需要特殊处理
-                System.out.println("Wrong ACK received: " + currentAck + ", expected: " + currentSeq);
-                // RDT2.1/2.2会处理这种情况
-                flag = 0;
+                // 负确认（NAK），检查序列号
+                int nakSeq = -currentAck;  // NAK序列号用负数表示
+                if (nakSeq == lastSentSeq) {
+                    // 收到当前包的NAK，需要重传
+                    System.out.println("Received NAK for seq: " + nakSeq);
+                    udt_send(tcpPack);  // 重传数据包
+                    flag = 0;  // 继续保持等待状态
+                } else {
+                    // 收到错误的NAK序列号
+                    System.out.println("Received NAK with wrong seq: " + nakSeq +
+                            ", last sent seq: " + lastSentSeq);
+                    flag = 0;  // 保持等待
+                }
             }
         }
     }
@@ -81,7 +103,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
 
         if (computedChkSum == receivedChkSum) {
             // 校验和正确，处理ACK
-            System.out.println("Receive ACK Number: " + recvPack.getTcpH().getTh_ack());
+            System.out.println("Receive ACK/NAK Number: " + recvPack.getTcpH().getTh_ack());
             ackQueue.add(recvPack.getTcpH().getTh_ack());
             System.out.println();
 
@@ -91,8 +113,9 @@ public class TCP_Sender extends TCP_Sender_ADT {
             // 校验和错误，ACK包本身出错
             System.out.println("ACK packet corrupted! Computed: " + computedChkSum +
                     ", Received: " + receivedChkSum);
-            // RDT2.1会处理ACK出错的情况
-            // 当前RDT2.0不处理ACK错误，可能会进入死锁
+            // RDT2.1处理：当ACK损坏时，重传当前数据包
+            System.out.println("ACK corrupted, retransmit seq: " + lastSentSeq);
+            udt_send(tcpPack);  // 重传当前包
         }
     }
 }
