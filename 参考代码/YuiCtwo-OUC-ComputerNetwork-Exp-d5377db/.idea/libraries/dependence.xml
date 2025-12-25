@@ -1,0 +1,10 @@
+<component name="libraryTable">
+  <library name="dependence">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/dependence/TCP_TestSys_Linux.jar!/" />
+      <root url="jar://$PROJECT_DIR$/dependence/TCP_Win_TestSys.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

@@ -12,13 +12,13 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 
     private TCP_PACKET ackPack;    // 回复的ACK报文段
     int sequence = 1;               // 用于记录当前待接收的包序号
-
-
+    int lastCorrectSeq = 0;         // 最后正确接收的序列号
 
     /* 构造函数 */
     public TCP_Receiver() {
         super();    // 调用超类构造函数
         super.initTCP_Receiver(this);   // 初始化TCP接收端
+        lastCorrectSeq = 0;
     }
 
     @Override
@@ -31,64 +31,76 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
         // 获取接收到的序列号
         int recvSeq = recvPack.getTcpH().getTh_seq();
 
-        // RDT2.1：检查校验和，如果出错发送带序列号的NAK
+        // RDT2.2: 总是发送ACK，没有NAK
+        // ACK号 = 最后正确接收的序列号
+
+        System.out.println("Receiver: seq=" + recvSeq +
+                ", expected=" + sequence +
+                ", lastCorrect=" + lastCorrectSeq);
+
         if(computedChkSum == receivedChkSum) {
-            // 校验和正确，生成ACK报文段
+            // 校验和正确
             System.out.println("Checksum correct for packet: " + recvSeq);
 
-            // 检查序列号是否正确（按序接收）
             if (recvSeq == sequence) {
-                // 序列号正确，生成正常ACK（正数表示ACK）
-                tcpH.setTh_ack(recvSeq);  // ACK序列号等于接收到的序列号
-                ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-
-                // 计算ACK包的校验和
-                tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-
-                // 回复ACK报文段
-                reply(ackPack);
+                // 序列号正确，接收数据
+                System.out.println("In-order packet received: " + recvSeq);
 
                 // 将接收到的正确有序的数据插入data队列，准备交付
                 dataQueue.add(recvPack.getTcpS().getData());
-                sequence += 100;
+                lastCorrectSeq = recvSeq; // 更新最后正确接收的序列号
+                sequence += 100; // 更新期望序列号
+
+                // 发送ACK
+                sendAck(lastCorrectSeq, recvPack.getSourceAddr()); // 添加目标地址
             } else if (recvSeq < sequence) {
-                // 收到旧的重复包，发送ACK确认这个包
+                // 收到旧的重复包
                 System.out.println("Duplicate packet received. Seq: " + recvSeq +
                         ", Expected: " + sequence);
-                tcpH.setTh_ack(recvSeq);  // ACK序列号等于重复包的序列号
-                ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-                tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-                reply(ackPack);
-                // 不交付数据，因为这是重复包
+                // 发送重复ACK（确认最后正确接收的包）
+                sendAck(lastCorrectSeq, recvPack.getSourceAddr()); // 添加目标地址
             } else {
-                // 收到未来的包（乱序），发送ACK确认最新正确接收的包
+                // 收到未来的包（乱序）
                 System.out.println("Out-of-order packet. Seq: " + recvSeq +
                         ", Expected: " + sequence);
-                tcpH.setTh_ack(sequence - 1);  // ACK最新正确接收的包
-                ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-                tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-                reply(ackPack);
+                // 发送重复ACK（确认最后正确接收的包）
+                sendAck(lastCorrectSeq, recvPack.getSourceAddr()); // 添加目标地址
             }
         } else {
-            // 校验和错误，发送带序列号的NAK（用负数表示NAK）
+            // 校验和错误
             System.out.println("Checksum error! Computed: " + computedChkSum +
                     ", Received: " + receivedChkSum);
             System.out.println("Problem: Packet Number: " + recvSeq +
                     ", Expected: " + sequence);
 
-            // 发送带序列号的NAK（用负的序列号表示NAK）
-            tcpH.setTh_ack(-recvSeq);  // 负号表示NAK，绝对值是出错的序列号
-            ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-            tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-            reply(ackPack);
+            // RDT2.2: 校验和错误时发送重复ACK（而不是NAK）
+            sendAck(lastCorrectSeq, recvPack.getSourceAddr()); // 添加目标地址
         }
 
         System.out.println();
 
-
         // 交付数据（每20组数据交付一次）
-        if(dataQueue.size() == 20)
+        if(dataQueue.size() >= 20) {
             deliver_data();
+        }
+    }
+
+    // 新增：发送ACK的辅助方法
+    private void sendAck(int ackSeq, java.net.InetAddress destAddr) {
+        // 设置ACK包的序列号（不重要）和确认号
+        tcpH.setTh_seq(0); // ACK包序列号设为0
+        tcpH.setTh_ack(ackSeq); // 确认号为最后正确接收的序列号
+
+        // 修复：传入目标地址
+        ackPack = new TCP_PACKET(tcpH, tcpS, destAddr);
+
+        // 计算ACK包的校验和
+        tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
+
+        // 回复ACK报文段
+        reply(ackPack);
+
+        System.out.println("Sent ACK: " + ackSeq);
     }
 
     @Override
@@ -122,7 +134,8 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
     // 回复ACK报文段
     public void reply(TCP_PACKET replyPack) {
         // 设置错误控制标志
-        tcpH.setTh_eflag((byte)1);  // ACK包设置为错误
+        // RDT2.2: ACK包也会出错，设置为出错模式
+        tcpH.setTh_eflag((byte)4);
 
         // 发送数据报
         client.send(replyPack);
