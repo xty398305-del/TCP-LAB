@@ -8,19 +8,25 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.util.*;
 
 public class TCP_Receiver extends TCP_Receiver_ADT {
 
     private TCP_PACKET ackPack;
     private int expectedSeq = 1;
-    private int lastAckSent = 0; // 记录最后发送的ACK号
+    private int lastAckSent = 0;
+
+    // SR协议：缓存乱序到达的包
+    private Map<Integer, TCP_PACKET> outOfOrderPackets;
+    private final int RECEIVE_WINDOW_SIZE = 4;
 
     public TCP_Receiver() {
         super();
         super.initTCP_Receiver(this);
         expectedSeq = 1;
         lastAckSent = 0;
-        dataQueue = new java.util.LinkedList<>();
+        dataQueue = new LinkedList<>();
+        outOfOrderPackets = new HashMap<>();
     }
 
     @Override
@@ -30,61 +36,69 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 
         int recvSeq = recvPack.getTcpH().getTh_seq();
 
-        System.out.println("Receiver: received seq=" + recvSeq +
-                ", expected=" + expectedSeq);
+        System.out.println("\n=== RECEIVER ===");
+        System.out.println("Received seq=" + recvSeq + ", expected=" + expectedSeq);
 
         if(computedChkSum == receivedChkSum) {
             // 校验和正确
             System.out.println("Checksum correct for packet: " + recvSeq);
 
+            // SR协议：发送该包的ACK（无论是否按序）
+            sendAck(recvSeq, recvPack.getSourceAddr());
+            lastAckSent = recvSeq;
+
             if (recvSeq == expectedSeq) {
+                // 按序到达
+                System.out.println("In-order packet received: seq=" + recvSeq);
+
                 // 1. 将数据插入data队列
                 dataQueue.add(recvPack.getTcpS().getData());
 
                 // 2. 更新期望序列号
                 expectedSeq++;
 
-                // 3. ✨ 关键：发送已确认的包序号（recvSeq）
-                sendAck(recvSeq, recvPack.getSourceAddr());
-                lastAckSent = recvSeq;
-
-                System.out.println("In-order packet received, new expectedSeq: " + expectedSeq);
+                // 3. 检查是否有缓存的包可以按序交付
+                checkAndDeliverCachedPackets();
 
                 // 4. 尝试交付数据
                 if(dataQueue.size() >= 20) {
                     deliver_data();
                 }
+            } else if (recvSeq > expectedSeq && recvSeq < expectedSeq + RECEIVE_WINDOW_SIZE) {
+                // 乱序但在窗口内，缓存它
+                System.out.println("Out-of-order packet within window, caching: seq=" + recvSeq);
+                outOfOrderPackets.put(recvSeq, recvPack);
             } else if (recvSeq < expectedSeq) {
-                // 重复的旧包
-                System.out.println("Duplicate packet: " + recvSeq +
-                        " (already received, expected: " + expectedSeq + ")");
-
-                // 发送已确认的最高序列号
-                sendAck(expectedSeq - 1, recvPack.getSourceAddr());
-                lastAckSent = expectedSeq - 1;
+                // 重复包
+                System.out.println("Duplicate packet: seq=" + recvSeq);
+                // 仍然发送ACK，但不需要处理数据
             } else {
-                // 乱序到达的分组
-                System.out.println("Out-of-order packet: " + recvSeq +
-                        " (expected: " + expectedSeq + ")");
-
-                // Go-Back-N: 发送重复ACK（确认最后一个按序接收的分组）
-                sendAck(expectedSeq - 1, recvPack.getSourceAddr());
-                lastAckSent = expectedSeq - 1;
+                // 超出接收窗口
+                System.out.println("Packet outside receive window, ignoring: seq=" + recvSeq);
             }
         } else {
             // 校验和错误
             System.out.println("Checksum error! Packet corrupted: " + recvSeq);
 
-            // 发送重复ACK
+            // SR协议：不发送ACK给损坏的包
+            // 或者发送前一个正确包的ACK（根据具体实现）
             sendAck(expectedSeq - 1, recvPack.getSourceAddr());
             lastAckSent = expectedSeq - 1;
         }
+    }
 
-        System.out.println();
+    // 检查缓存的包是否可以按序交付
+    private void checkAndDeliverCachedPackets() {
+        while (outOfOrderPackets.containsKey(expectedSeq)) {
+            System.out.println("Delivering cached packet: seq=" + expectedSeq);
+            TCP_PACKET cachedPacket = outOfOrderPackets.remove(expectedSeq);
+            dataQueue.add(cachedPacket.getTcpS().getData());
+            expectedSeq++;
+        }
+        System.out.println("New expectedSeq after delivering cached: " + expectedSeq);
     }
 
     private void sendAck(int ackSeq, InetAddress destAddr) {
-        // 避免重复发送相同的ACK
         if (ackSeq == lastAckSent) {
             System.out.println("Duplicate ACK for seq: " + ackSeq);
         }
