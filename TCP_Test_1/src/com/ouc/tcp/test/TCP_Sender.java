@@ -1,195 +1,283 @@
 package com.ouc.tcp.test;
 
 import com.ouc.tcp.client.TCP_Sender_ADT;
-import com.ouc.tcp.client.UDT_Timer;
-import com.ouc.tcp.client.UDT_RetransTask;
 import com.ouc.tcp.message.*;
+
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.LinkedList;
 
 public class TCP_Sender extends TCP_Sender_ADT {
 
-    private TCP_PACKET tcpPack;    // 待发送的TCP数据报
-    private volatile int flag = 0;
-    private int currentSeq = 1;     // 当前序列号
-    private int lastSentSeq = 0;    // 最后发送的数据包序列号
-    private int lastAckedSeq = 0;   // 最后确认的序列号
+    private TCP_PACKET tcpPack;
+    private int nextSeqNum = 1;
+    private int baseSeq = 1;
+    private final int WINDOW_SIZE = 4;
+    // 在TCP_Sender类中添加
+    private int duplicateAckCount = 0;
 
-    // RDT 3.0 新增：使用工程提供的定时器和重传任务
-    private UDT_Timer retransTimer;     // 重传定时器
-    private UDT_RetransTask retransTask; // 重传任务
-    private boolean timerRunning = false; // 定时器是否在运行
-    private final int TIMEOUT_INTERVAL = 1000; // 超时时间1秒
-    private final int MAX_RETRIES = 5;      // 最大重传次数
-    private int retryCount = 0;     // 当前重传次数
-    private TCP_PACKET[] sentPackets; // 已发送但未确认的数据包（用于重传）
+    // 简化的窗口管理
+    private LinkedList<TCP_PACKET> sentPackets;  // 已发送但未确认的包
+    private Timer timer;
 
-    /* 构造函数 */
+    // 调试信息
+    private int sendCount = 0;
+    private int ackCount = 0;
+    private int timeoutCount = 0;
+
     public TCP_Sender() {
-        super();    // 调用超类构造函数
-        super.initTCP_Sender(this);     // 初始化TCP发送端
-        lastAckedSeq = 0;
-        retryCount = 0;
-        retransTimer = new UDT_Timer(); // 创建定时器
-        sentPackets = new TCP_PACKET[10]; // 假设最多缓存10个未确认包
+        super();
+        super.initTCP_Sender(this);
+        sentPackets = new LinkedList<>();
+        timer = new Timer();
+        ackQueue = new LinkedList<>();
+
+        System.out.println("=== TCP Sender Initialized ===");
+        System.out.println("Window Size: " + WINDOW_SIZE);
     }
 
     @Override
-    // 可靠发送（应用层调用）：封装应用层数据，产生TCP数据报
     public void rdt_send(int dataIndex, int[] appData) {
+        sendCount++;
+        System.out.println("\n=== SEND OPERATION #" + sendCount + " ===");
+        System.out.println("Current state: baseSeq=" + baseSeq + ", nextSeqNum=" + nextSeqNum);
+        System.out.println("Window size: " + sentPackets.size() + "/" + WINDOW_SIZE);
 
-        // 重置重传计数
-        retryCount = 0;
+        // 检查窗口是否已满
+        if (sentPackets.size() >= WINDOW_SIZE) {
+            System.out.println("ERROR: Window full! Cannot send seq " + nextSeqNum);
+            System.out.println("Window contents: " + getWindowContents());
+            return;
+        }
 
-        // 生成TCP数据报（设置序号和数据字段/校验和）
-        currentSeq = dataIndex * appData.length + 1;
-        tcpH.setTh_seq(currentSeq);
-        tcpS.setData(appData);
-        tcpPack = new TCP_PACKET(tcpH, tcpS, destinAddr);
+        // ✨ 关键修复：为每个包创建新的TCP头部对象！
+        // 从父类复制默认的TCP头部设置
+       // TCP_HEADER newHeader = new TCP_HEADER();
 
-        // 计算并设置校验和
+        // 在rdt_send方法中创建包时
+        TCP_HEADER newHeader = new TCP_HEADER();
+        newHeader.setTh_seq(nextSeqNum);
+        newHeader.setTh_ack(0);  // ACK号由接收方设置
+        newHeader.setTh_eflag((byte)7);
+// 复制其他必要的头部字段...
+
+        TCP_SEGMENT newSegment = new TCP_SEGMENT();
+        newSegment.setData(appData);
+
+        tcpPack = new TCP_PACKET(newHeader, newSegment, destinAddr);
+
+// 计算校验和
         short checksum = CheckSum.computeChkSum(tcpPack);
-        tcpH.setTh_sum(checksum);
-        tcpPack.setTcpH(tcpH);
+        newHeader.setTh_sum(checksum);
 
-        lastSentSeq = currentSeq;
-        flag = 0;
+        // 添加到已发送队列
+        sentPackets.add(tcpPack);
 
-        // 缓存当前发送的数据包（用于重传）
-        sentPackets[currentSeq % 10] = tcpPack;
+        System.out.println("Added packet seq=" + nextSeqNum + " to window");
+        System.out.println("Window contents after adding: " + getWindowContents());
 
-        // 发送TCP数据报
+        // 发送包
+        System.out.println("Sending packet seq=" + nextSeqNum);
         udt_send(tcpPack);
 
-        // RDT 3.0: 启动定时器（使用工程提供的定时器）
-        startTimer();
-
-        // 等待ACK报文
-        waitForAck();
-    }
-
-    // 新增：等待ACK方法（RDT 3.0使用定时器机制）
-    private void waitForAck() {
-        System.out.println("Waiting for ACK for seq: " + lastSentSeq);
-
-        long startTime = System.currentTimeMillis();
-        final long MAX_WAIT_TIME = TIMEOUT_INTERVAL * MAX_RETRIES * 2; // 最大等待时间
-
-        while (flag == 0) {
-            // 检查是否超过最大等待时间
-            if (System.currentTimeMillis() - startTime > MAX_WAIT_TIME) {
-                System.out.println("Max wait time reached for seq: " + lastSentSeq + ", giving up.");
-                stopTimer(); // 停止定时器
-                flag = 1; // 强制结束等待
-                break;
-            }
-
-            // 短暂休眠避免100% CPU占用
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        // 如果这是第一个包，启动定时器
+        if (sentPackets.size() == 1) {
+            System.out.println("Starting timer for window base=" + baseSeq);
+            startTimer();
         }
 
-        // 收到ACK，停止定时器
-        stopTimer();
-        System.out.println("ACK received for seq: " + lastSentSeq + ", transmission successful.");
+        // 更新下一个序列号
+        nextSeqNum++;
+
+        System.out.println("Final state: baseSeq=" + baseSeq + ", nextSeqNum=" + nextSeqNum);
     }
 
-    // 新增：启动定时器（使用UDT_Timer和UDT_RetransTask）
     private void startTimer() {
-        if (!timerRunning) {
-            timerRunning = true;
-
-            // 创建重传任务
-            retransTask = new UDT_RetransTask(client, tcpPack);
-
-            // 启动定时器：1秒后开始执行，之后每1秒执行一次
-            retransTimer.schedule(retransTask, TIMEOUT_INTERVAL, TIMEOUT_INTERVAL);
-
-            System.out.println("Timer started for seq: " + lastSentSeq);
+        // 取消现有定时器
+        if (timer != null) {
+            timer.cancel();
         }
-    }
+        timer = new Timer();
 
-    // 新增：停止定时器
-    private void stopTimer() {
-        if (timerRunning && retransTimer != null) {
-            retransTimer.cancel();
-            retransTimer = new UDT_Timer(); // 创建新的定时器实例
-            timerRunning = false;
-            System.out.println("Timer stopped for seq: " + lastSentSeq);
-        }
+        // 启动新定时器
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                timeoutCount++;
+                System.out.println("\n=== TIMEOUT #" + timeoutCount + " ===");
+                handleTimeout();
+            }
+        }, 200);
+
+        System.out.println("Timer started (will expire in 1 second)");
     }
 
     @Override
-    // 不可靠发送：将打包好的TCP数据报通过不可靠传输信道发送
     public void udt_send(TCP_PACKET stcpPack) {
-        // 设置错误控制标志
-        tcpH.setTh_eflag((byte)4);  //
+        // 打印发送的包信息
+        int seq = stcpPack.getTcpH().getTh_seq();
+        System.out.println("[Network] Sending packet seq=" + seq + " to network");
 
-        // 发送数据报
+        // 设置错误控制标志
+        tcpH.setTh_eflag((byte)2);
+
+        // 实际发送
         client.send(stcpPack);
+    }
+
+    private void handleTimeout() {
+        System.out.println("=== TIMEOUT HANDLER ===");
+        System.out.println("Current baseSeq: " + baseSeq);
+        System.out.println("Window contents: " + getWindowContents());
+
+        if (sentPackets.isEmpty()) {
+            System.out.println("Window is empty, nothing to retransmit");
+            return;
+        }
+
+        // ✨ 关键：重传所有在窗口中的包
+        System.out.println("Go-Back-N: Retransmitting ALL packets in window");
+
+        // 创建一个副本来遍历，避免并发修改问题
+        LinkedList<TCP_PACKET> packetsToRetransmit = new LinkedList<>(sentPackets);
+
+        for (TCP_PACKET packet : packetsToRetransmit) {
+            int seq = packet.getTcpH().getTh_seq();
+            System.out.println("Retransmitting seq=" + seq);
+
+            // 重新计算校验和
+            short checksum = CheckSum.computeChkSum(packet);
+            packet.getTcpH().setTh_sum(checksum);
+
+            udt_send(packet);
+        }
+
+        // 重启定时器
+        System.out.println("Restarting timer after retransmission");
+        startTimer();
+    }
+
+    @Override
+    public void recv(TCP_PACKET recvPack) {
+        ackCount++;
+        System.out.println("\n=== RECEIVE ACK #" + ackCount + " ===");
+
+        short computedChkSum = CheckSum.computeChkSum(recvPack);
+        short receivedChkSum = recvPack.getTcpH().getTh_sum();
+
+        System.out.println("ACK checksum - Computed: " + computedChkSum + ", Received: " + receivedChkSum);
+
+        if (computedChkSum == receivedChkSum) {
+            int ackNum = recvPack.getTcpH().getTh_ack();
+            System.out.println("Valid ACK received: " + ackNum);
+            System.out.println("Current baseSeq: " + baseSeq);
+            System.out.println("Window before ACK: " + getWindowContents());
+
+            processAck(ackNum);
+        } else {
+            System.out.println("ERROR: ACK checksum failed! Discarding ACK.");
+        }
+    }
+
+    private void processAck(int ackNum) {
+        System.out.println("Processing ACK=" + ackNum);
+        System.out.println("Current baseSeq: " + baseSeq);
+        System.out.println("Window contents: " + getWindowContents());
+
+        //
+        // 累积确认：所有序列号 <= ackNum 的包都已确认
+
+        if (ackNum < baseSeq) {
+            // 旧的ACK，忽略
+            System.out.println("Old ACK (ackNum < baseSeq), ignoring");
+            return;
+        }
+
+        // 累积确认：移除所有序列号 <= ackNum 的包
+        int removedCount = 0;
+        while (!sentPackets.isEmpty()) {
+            TCP_PACKET firstPacket = sentPackets.getFirst();
+            int firstSeq = firstPacket.getTcpH().getTh_seq();
+
+            if (firstSeq <= ackNum) {
+                sentPackets.removeFirst();
+                removedCount++;
+                System.out.println("Removed confirmed packet seq=" + firstSeq);
+            } else {
+                break;
+            }
+        }
+
+        System.out.println("Removed " + removedCount + " packets from window");
+
+        // 重置重复ACK计数
+        duplicateAckCount = 0;
+
+        // 更新baseSeq
+        if (!sentPackets.isEmpty()) {
+            baseSeq = sentPackets.getFirst().getTcpH().getTh_seq();
+            System.out.println("New baseSeq (from window): " + baseSeq);
+
+            // 重启定时器
+            System.out.println("Restarting timer for new baseSeq=" + baseSeq);
+            startTimer();
+        } else {
+            baseSeq = nextSeqNum;
+            System.out.println("Window empty, new baseSeq (nextSeqNum): " + baseSeq);
+
+            // 停止定时器
+            System.out.println("Stopping timer (window empty)");
+            if (timer != null) {
+                timer.cancel();
+                timer = null;
+            }
+        }
+
+        System.out.println("Window after ACK: " + getWindowContents());
     }
 
     @Override
     public void waitACK() {
-        if(!ackQueue.isEmpty()) {
-            int currentAck = ackQueue.poll();
-
-            System.out.println("Processing ACK: " + currentAck +
-                    ", lastSentSeq: " + lastSentSeq +
-                    ", lastAckedSeq: " + lastAckedSeq);
-
-            // RDT 3.0: 处理ACK，支持ACK丢失和超时重传
-            if (currentAck == lastSentSeq) {
-                // 收到对当前包的ACK
-                System.out.println("Correct ACK received for seq: " + currentAck);
-                lastAckedSeq = currentAck;
-                flag = 1;  // 设置标志，结束等待
-            }
-             else if (currentAck < lastSentSeq && currentAck > 0) {
-                // 收到旧的ACK（可能是延迟的ACK），忽略
-                System.out.println("Received old/delayed ACK: " + currentAck +
-                        ", current expected: " + lastSentSeq);
-            } else {
-                // 收到其他ACK（乱序或错误）
-                System.out.println("Unexpected ACK: " + currentAck);
-            }
-        }
+        // 空实现
     }
 
-    // 新增：从缓冲区查找指定序列号的包
-    private TCP_PACKET findPacketInBuffer(int seq) {
-        // 简单实现：在sentPackets数组中查找
+    private String getWindowContents() {
+        if (sentPackets.isEmpty()) {
+            return "[]";
+        }
+
+        StringBuilder sb = new StringBuilder("[");
         for (TCP_PACKET packet : sentPackets) {
-            if (packet != null && packet.getTcpH().getTh_seq() == seq) {
-                return packet;
-            }
+            int seq = packet.getTcpH().getTh_seq();
+            sb.append(seq).append(" ");
         }
-        return null;
+        sb.deleteCharAt(sb.length() - 1);  // 移除最后一个空格
+        sb.append("]");
+        return sb.toString();
     }
 
-    @Override
-    // 接收到ACK报文：检查校验和，将确认号插入ack队列
-    public void recv(TCP_PACKET recvPack) {
-        // 检查ACK包的校验和
-        short computedChkSum = CheckSum.computeChkSum(recvPack);
-        short receivedChkSum = recvPack.getTcpH().getTh_sum();
-
-        if (computedChkSum == receivedChkSum) {
-            // 校验和正确，处理ACK
-            int ackNum = recvPack.getTcpH().getTh_ack();
-            System.out.println("Receive ACK Number: " + ackNum);
-            ackQueue.add(ackNum);
-            System.out.println();
-
-            // 处理ACK报文
-            waitACK();
-        } else {
-            // 校验和错误，ACK包本身出错
-            System.out.println("ACK packet corrupted! Computed: " + computedChkSum +
-                    ", Received: " + receivedChkSum);
-            // RDT 3.0: ACK损坏，不重传数据包，等待超时
-            System.out.println("ACK corrupted, waiting for timeout retransmission...");
+    private String getWindowSequences() {
+        StringBuilder sb = new StringBuilder("[");
+        int expectedCount = 0;
+        for (int seq = baseSeq; seq < nextSeqNum && expectedCount < WINDOW_SIZE; seq++) {
+            sb.append(seq).append(" ");
+            expectedCount++;
         }
+        if (sb.length() > 1) {
+            sb.deleteCharAt(sb.length() - 1);
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    // 添加一个方法来打印完整状态
+    private void printFullState() {
+        System.out.println("\n=== FULL STATE ===");
+        System.out.println("baseSeq: " + baseSeq);
+        System.out.println("nextSeqNum: " + nextSeqNum);
+        System.out.println("Window size: " + sentPackets.size() + "/" + WINDOW_SIZE);
+        System.out.println("Window contents: " + getWindowContents());
+        System.out.println("Expected window: " + getWindowSequences());
+        System.out.println("=== END STATE ===");
     }
 }
