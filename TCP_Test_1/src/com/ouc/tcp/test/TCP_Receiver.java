@@ -16,9 +16,8 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
     private int expectedSeq = 1;
     private int lastAckSent = 0;
 
-    // SR协议：缓存乱序到达的包
-    private Map<Integer, TCP_PACKET> outOfOrderPackets;
-    private final int RECEIVE_WINDOW_SIZE = 4;
+    // Tahoe接收方：按序接收
+    private int lastDeliveredSeq = 0;  // 最近交付的序列号
 
     public TCP_Receiver() {
         super();
@@ -26,7 +25,6 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
         expectedSeq = 1;
         lastAckSent = 0;
         dataQueue = new LinkedList<>();
-        outOfOrderPackets = new HashMap<>();
     }
 
     @Override
@@ -43,10 +41,7 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
             // 校验和正确
             System.out.println("Checksum correct for packet: " + recvSeq);
 
-            // SR协议：发送该包的ACK（无论是否按序）
-            sendAck(recvSeq, recvPack.getSourceAddr());
-            lastAckSent = recvSeq;
-
+            // Tahoe: 累积确认，只确认按序到达的包
             if (recvSeq == expectedSeq) {
                 // 按序到达
                 System.out.println("In-order packet received: seq=" + recvSeq);
@@ -56,50 +51,37 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 
                 // 2. 更新期望序列号
                 expectedSeq++;
+                lastAckSent = recvSeq;
 
-                // 3. 检查是否有缓存的包可以按序交付
-                checkAndDeliverCachedPackets();
+                // 3. 发送累积ACK
+                sendAck(lastAckSent, recvPack.getSourceAddr());
 
                 // 4. 尝试交付数据
                 if(dataQueue.size() >= 20) {
                     deliver_data();
                 }
-            } else if (recvSeq > expectedSeq && recvSeq < expectedSeq + RECEIVE_WINDOW_SIZE) {
-                // 乱序但在窗口内，缓存它
-                System.out.println("Out-of-order packet within window, caching: seq=" + recvSeq);
-                outOfOrderPackets.put(recvSeq, recvPack);
-            } else if (recvSeq < expectedSeq) {
+            } else if (recvSeq > expectedSeq) {
+                // 乱序到达，缓存或丢弃（这里简单实现为丢弃并发送重复ACK）
+                System.out.println("Out-of-order packet, sending duplicate ACK for seq=" + (expectedSeq - 1));
+                // 发送上一个正确接收包的ACK（重复ACK）
+                sendAck(expectedSeq - 1, recvPack.getSourceAddr());
+            } else {
                 // 重复包
                 System.out.println("Duplicate packet: seq=" + recvSeq);
-                // 仍然发送ACK，但不需要处理数据
-            } else {
-                // 超出接收窗口
-                System.out.println("Packet outside receive window, ignoring: seq=" + recvSeq);
+                // 发送累积ACK
+                sendAck(lastAckSent, recvPack.getSourceAddr());
             }
         } else {
             // 校验和错误
             System.out.println("Checksum error! Packet corrupted: " + recvSeq);
-
-            // SR协议：不发送ACK给损坏的包
-            // 或者发送前一个正确包的ACK（根据具体实现）
+            // 发送上一个正确接收包的ACK
             sendAck(expectedSeq - 1, recvPack.getSourceAddr());
             lastAckSent = expectedSeq - 1;
         }
     }
 
-    // 检查缓存的包是否可以按序交付
-    private void checkAndDeliverCachedPackets() {
-        while (outOfOrderPackets.containsKey(expectedSeq)) {
-            System.out.println("Delivering cached packet: seq=" + expectedSeq);
-            TCP_PACKET cachedPacket = outOfOrderPackets.remove(expectedSeq);
-            dataQueue.add(cachedPacket.getTcpS().getData());
-            expectedSeq++;
-        }
-        System.out.println("New expectedSeq after delivering cached: " + expectedSeq);
-    }
-
     private void sendAck(int ackSeq, InetAddress destAddr) {
-        if (ackSeq == lastAckSent) {
+        if (ackSeq == lastAckSent && ackSeq > 0) {
             System.out.println("Duplicate ACK for seq: " + ackSeq);
         }
 
