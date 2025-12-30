@@ -102,7 +102,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
             public void run() {
                 checkTimeout();
             }
-        }, 0, 800);  // 每600ms检查一次超时
+        }, 0, 800);  // 每800ms检查一次超时
     }
 
     // 检查超时
