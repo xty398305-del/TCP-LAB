@@ -12,14 +12,19 @@ public class TCP_Sender extends TCP_Sender_ADT {
     private int nextSeqNum = 1;
     private int baseSeq = 1;
 
-    // Tahoe协议：累积确认
+    // Reno协议：累积确认
     private int lastACKSeq = 0;  // 最近收到的ACK序号
     private int duplicateACKCount = 0;  // 重复ACK计数
 
-    // Tahoe拥塞控制参数
+    // Reno拥塞控制参数
     private int cwnd = 1;  // 拥塞窗口大小
     private int ssthresh = 8;  // 慢启动阈值（初始设为8）
     private int ConAck = 0;  // 累计ACK计数（用于拥塞避免）
+
+    // Reno新增：快速恢复相关状态
+    private boolean inFastRecovery = false;  // 是否处于快速恢复阶段
+    private int recoveryPoint = 0;  // 进入快速恢复时的序列号（期望的下一个ACK）
+    private int fastRecoveryCount = 0;  // 快速恢复阶段收到的ACK计数
 
     // 使用Map来管理每个包的状态
     private Map<Integer, TCP_PACKET> packets;
@@ -39,7 +44,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
         // 启动全局计时器
         startGlobalTimer();
 
-        System.out.println("=== TCP Tahoe Sender Initialized ===");
+        System.out.println("=== TCP Reno Sender Initialized ===");
         System.out.println("Initial cwnd=" + cwnd + ", ssthresh=" + ssthresh);
     }
 
@@ -50,7 +55,8 @@ public class TCP_Sender extends TCP_Sender_ADT {
         System.out.println("Current state: baseSeq=" + baseSeq +
                 ", nextSeqNum=" + nextSeqNum +
                 ", cwnd=" + cwnd +
-                ", ssthresh=" + ssthresh);
+                ", ssthresh=" + ssthresh +
+                ", inFastRecovery=" + inFastRecovery);
 
         // 检查是否在拥塞窗口内
         if (nextSeqNum - baseSeq >= cwnd) {
@@ -96,7 +102,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
             public void run() {
                 checkTimeout();
             }
-        }, 0, 800);  // 每200ms检查一次超时
+        }, 0, 800);  // 每600ms检查一次超时
     }
 
     // 检查超时
@@ -116,14 +122,22 @@ public class TCP_Sender extends TCP_Sender_ADT {
         // 只有当存在超时的包时才进行窗口重置
         if (hasTimeout) {
             timeoutCount++;
-            System.out.println("\n=== TAHOE: Timeout detected, reducing window ===");
+            System.out.println("\n=== RENO: Timeout detected, reducing window ===");
             System.out.println("cwnd " + cwnd + " to 1");
             System.out.println("ssthresh " + ssthresh + " to " + Math.max(cwnd / 2, 2));
 
-            // Tahoe: 发生超时，ssthresh设为当前cwnd的一半（至少为2），cwnd重置为1
+            // Reno: 发生超时，ssthresh设为当前cwnd的一半（至少为2），cwnd重置为1
             ssthresh = Math.max(cwnd / 2, 2);
             cwnd = 1;
             ConAck = 0;  // 重置累计ACK计数
+
+            // 退出快速恢复状态（如果正在快速恢复）
+            if (inFastRecovery) {
+                inFastRecovery = false;
+                recoveryPoint = 0;
+                fastRecoveryCount = 0;
+                System.out.println("Exiting fast recovery due to timeout");
+            }
         }
     }
 
@@ -131,7 +145,8 @@ public class TCP_Sender extends TCP_Sender_ADT {
     public void udt_send(TCP_PACKET stcpPack) {
         int seq = stcpPack.getTcpH().getTh_seq();
         System.out.println("[Network] Sending packet seq=" + seq +
-                " (cwnd=" + cwnd + ", ssthresh=" + ssthresh + ")");
+                " (cwnd=" + cwnd + ", ssthresh=" + ssthresh +
+                ", inFastRecovery=" + inFastRecovery + ")");
         client.send(stcpPack);
     }
 
@@ -150,7 +165,8 @@ public class TCP_Sender extends TCP_Sender_ADT {
             int ackNum = recvPack.getTcpH().getTh_ack();
             System.out.println("Valid ACK received: " + ackNum);
             System.out.println("Current baseSeq: " + baseSeq);
-            System.out.println("Current cwnd=" + cwnd + ", ssthresh=" + ssthresh);
+            System.out.println("Current cwnd=" + cwnd + ", ssthresh=" + ssthresh +
+                    ", inFastRecovery=" + inFastRecovery);
 
             processAck(ackNum);
         } else {
@@ -161,7 +177,21 @@ public class TCP_Sender extends TCP_Sender_ADT {
     private void processAck(int ackNum) {
         System.out.println("Processing ACK=" + ackNum);
 
-        // Tahoe: 累积确认
+        if (inFastRecovery) {
+            // Reno: 处于快速恢复阶段
+            processAckInFastRecovery(ackNum);
+        } else {
+            // 正常阶段
+            processAckNormal(ackNum);
+        }
+
+        System.out.println("New baseSeq: " + baseSeq);
+        System.out.println("New cwnd=" + cwnd + ", ssthresh=" + ssthresh +
+                ", inFastRecovery=" + inFastRecovery);
+    }
+
+    private void processAckNormal(int ackNum) {
+        // Reno: 累积确认
         if (ackNum > lastACKSeq) {
             // 新的ACK，更新lastACKSeq
             lastACKSeq = ackNum;
@@ -180,7 +210,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
                 baseSeq = ackNum + 1;
             }
 
-            // Tahoe拥塞控制
+            // Reno拥塞控制（正常阶段）
             updateCongestionWindow();
 
         } else if (ackNum == lastACKSeq) {
@@ -188,18 +218,97 @@ public class TCP_Sender extends TCP_Sender_ADT {
             duplicateACKCount++;
             System.out.println("Duplicate ACK #" + duplicateACKCount + " for seq=" + ackNum);
 
-            // Tahoe: 3个重复ACK触发快速重传
-            if (duplicateACKCount >= 3) {
-                System.out.println("\n=== TAHOE: Fast Retransmit for seq=" + (ackNum + 1) + " ===");
-                fastRetransmit(ackNum + 1);
+            // Reno: 3个重复ACK触发快速重传和快速恢复
+            if (duplicateACKCount == 3) {
+                System.out.println("\n=== RENO: Fast Retransmit and Recovery for seq=" + (ackNum + 1) + " ===");
+                enterFastRecovery(ackNum + 1);
+            } else if (duplicateACKCount > 3) {
+                // 已经有3个以上重复ACK，继续快速重传
+                System.out.println("Additional duplicate ACK in normal state: #" + duplicateACKCount);
             }
         }
-
-        System.out.println("New baseSeq: " + baseSeq);
-        System.out.println("New cwnd=" + cwnd + ", ssthresh=" + ssthresh);
     }
 
-    // Tahoe拥塞窗口更新
+    private void processAckInFastRecovery(int ackNum) {
+        // Reno: 快速恢复阶段的ACK处理
+        if (ackNum > lastACKSeq) {
+            // 收到新的ACK（可能是重传包的ACK）
+            if (ackNum >= recoveryPoint) {
+                // 收到了期望的新ACK，退出快速恢复
+                System.out.println("Received new ACK in fast recovery, exiting fast recovery");
+
+                // 退出快速恢复：cwnd设为ssthresh
+                cwnd = ssthresh;
+                inFastRecovery = false;
+                recoveryPoint = 0;
+                fastRecoveryCount = 0;
+
+                // 更新lastACKSeq
+                lastACKSeq = ackNum;
+                duplicateACKCount = 0;
+
+                // 更新baseSeq
+                if (ackNum >= baseSeq) {
+                    // 移除已确认的包
+                    Iterator<Integer> it = packets.keySet().iterator();
+                    while (it.hasNext()) {
+                        int seq = it.next();
+                        if (seq <= ackNum) {
+                            it.remove();
+                        }
+                    }
+                    baseSeq = ackNum + 1;
+                }
+            } else {
+                // 仍然在快速恢复中，但收到了部分确认
+                System.out.println("Partial ACK in fast recovery: " + ackNum);
+
+                // 重传下一个期望的包
+                int nextExpectedSeq = ackNum + 1;
+                if (packets.containsKey(nextExpectedSeq)) {
+                    TCP_PACKET packet = packets.get(nextExpectedSeq);
+                    System.out.println("Fast retransmitting seq=" + nextExpectedSeq + " after partial ACK");
+
+                    short checksum = CheckSum.computeChkSum(packet);
+                    packet.getTcpH().setTh_sum(checksum);
+
+                    udt_send(packet);
+                }
+            }
+        } else if (ackNum == lastACKSeq) {
+            // 在快速恢复阶段收到重复ACK
+            fastRecoveryCount++;
+            System.out.println("Duplicate ACK in fast recovery: #" + fastRecoveryCount);
+
+            // Reno: 在快速恢复阶段，每收到一个重复ACK，cwnd加1
+            // 这允许发送新数据包，保持数据流
+            cwnd++;
+            System.out.println("Fast Recovery: cwnd increased to " + cwnd);
+
+            // 尝试发送新数据（如果有）
+            System.out.println("Window size in fast recovery: " + (nextSeqNum - baseSeq) + "/" + cwnd);
+        }
+    }
+
+    // 进入快速恢复阶段（Reno特有）
+    private void enterFastRecovery(int seqNum) {
+        // 1. 设置慢启动阈值
+        ssthresh = Math.max(cwnd / 2, 2);
+
+        // 2. 重传丢失的包
+        fastRetransmit(seqNum);
+
+        // 3. 进入快速恢复阶段
+        inFastRecovery = true;
+        recoveryPoint = seqNum;  // 期望的下一个序列号
+        fastRecoveryCount = 0;
+
+        // 4. 调整拥塞窗口：cwnd = ssthresh + 3（因为有3个重复ACK）
+        cwnd = ssthresh + 3;
+        System.out.println("Entering fast recovery: cwnd set to " + cwnd + " (ssthresh=" + ssthresh + ")");
+    }
+
+    // Reno拥塞窗口更新（只在正常阶段调用）
     private void updateCongestionWindow() {
         // 判断当前处于慢启动阶段还是拥塞避免阶段
         if (cwnd < ssthresh) { // 如果拥塞窗口小于慢启动阈值，执行慢启动
@@ -226,14 +335,6 @@ public class TCP_Sender extends TCP_Sender_ADT {
             packet.getTcpH().setTh_sum(checksum);
 
             udt_send(packet);
-
-            // Tahoe: 快速重传后，ssthresh设为当前cwnd的一半，cwnd重置为1
-            System.out.println("After fast retransmit: ssthresh " + ssthresh +
-                    " to " + Math.max(cwnd / 2, 2) +
-                    ", cwnd " + cwnd + " to 1");
-            ssthresh = Math.max(cwnd / 2, 2);
-            cwnd = 1;
-            ConAck = 0;
         }
     }
 
