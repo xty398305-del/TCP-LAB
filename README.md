@@ -1,5 +1,7 @@
 # TCP-Lab
 The lab materials for undergraduates to realize TCP protocol on the simulation platform.
+基于Java实现的TCP可靠通信模拟，包含慢开始、流量控制、拥塞控制、快重传、快恢复等核心功能。
+以下为包含的文档以及说明。
 
 - 文档说明
   
@@ -13,10 +15,6 @@ The lab materials for undergraduates to realize TCP protocol on the simulation p
 
 -- 计算机网络TCP评分表：用于给实验实现进行评价的评分表，包含评价指标
 
--- 《计算机网络》课程设计评分关注点.docx：说明对实验实现的评价指标的关注点
-
--- 计算机网络实验报告错误要点总结.docx: 对往年中学生在撰写实验报告时的错误进行总结
-
 - 文件夹说明
 
 -- TCP_TestCode：整个实验系统的源代码，供参考和改进
@@ -27,4 +25,4 @@ The lab materials for undergraduates to realize TCP protocol on the simulation p
 
 -- 所有Java IDE均可使用
 
--- JDK建议：下载jdk-6-6u45-windows-i586.exe 或低于 JDK 8的版本
+-- JDK建议：JDK 11
